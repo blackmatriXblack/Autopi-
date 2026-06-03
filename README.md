@@ -22,3 +22,4 @@ The page runs indefinitely in any modern browser. It has been tested to generate
 ## Design Philosophy
 
 **Extreme minimalism** – no text labels, no buttons (except the hidden smart scrolling behavior), no external fonts or assets. The page consists solely of a white canvas, the number π, and a silent clock. It embodies the beauty of infinite, uninterrupted computation.
+website:https://blackmatrixblack.github.io/Autopi-/
