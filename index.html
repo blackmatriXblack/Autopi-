@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>π ∞</title>
+    <!-- 
+      ======================================================================
+      ENGLISH TECHNICAL NOTE (approx. 200 words)
+      ======================================================================
+      This document implements an infinite, non‑blocking π digit generator
+      using the classic Rabinowitz & Wagon spigot algorithm. The generator
+      relies on BigInt arithmetic, which guarantees exact integer operations
+      without any upper bound on the number of digits. Digits are produced as
+      an ES6 generator and consumed in batches.
+
+      To keep the UI completely responsive while streaming π forever, the
+      script uses:
+      – Adaptive batch sizing: more digits per batch when the total is low,
+        smaller batches after hundreds of thousands of digits to avoid long
+        micro‑tasks.
+      – A pending buffer combined with requestIdleCallback‑style flushing:
+        new digits are appended to the DOM using insertAdjacentHTML, which
+        adds only new text nodes without ever reparsing existing content.
+      – A lightweight scheduler that yields to the event loop every ~18‑28 ms.
+      – Automatic scroll‑to‑bottom that temporarily disables itself when the
+        user scrolls up, then re‑enables after 4.5 seconds of inactivity.
+
+      The floating timer shows elapsed time in HH:MM:SS format, updated every
+      second. No external fonts, no icons, no text labels — only pure
+      numbers, white background, and a monospaced typeface. The entire
+      interface is designed for extreme minimalism and infinite scalability.
+      ======================================================================
+    -->
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #ffffff;
+            font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
+
+        .pi-scroll {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            scroll-behavior: smooth;
+            background: #ffffff;
+            padding: 1.2rem 1.8rem;
+        }
+
+        .pi-digits {
+            font-size: 17px;
+            line-height: 1.65;
+            word-break: break-all;
+            white-space: normal;
+            color: #1a1f2c;
+            font-weight: 420;
+            letter-spacing: 0.012em;
+        }
+
+        .timer {
+            position: fixed;
+            top: 18px;
+            right: 22px;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 15px;
+            font-weight: 430;
+            color: #8a99aa;
+            background: rgba(255, 255, 255, 0.75);
+            backdrop-filter: blur(3px);
+            padding: 4px 12px;
+            border-radius: 48px;
+            letter-spacing: 0.5px;
+            z-index: 50;
+            user-select: none;
+            pointer-events: none;
+            box-shadow: 0 0 0 0.5px #e9edf2;
+        }
+
+        .pi-scroll::-webkit-scrollbar {
+            width: 6px;
+        }
+        .pi-scroll::-webkit-scrollbar-track {
+            background: #f1f3f8;
+        }
+        .pi-scroll::-webkit-scrollbar-thumb {
+            background: #cfd7e6;
+            border-radius: 8px;
+        }
+        .pi-scroll::-webkit-scrollbar-thumb:hover {
+            background: #b0bed6;
+        }
+
+        @media (max-width: 680px) {
+            .pi-scroll {
+                padding: 0.9rem 1.2rem;
+            }
+            .pi-digits {
+                font-size: 14.5px;
+                line-height: 1.55;
+            }
+            .timer {
+                top: 12px;
+                right: 16px;
+                font-size: 13px;
+                padding: 3px 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="pi-scroll" id="piScrollArea">
+    <div class="pi-digits" id="piDigitsArea">
+        <span>3.</span><span id="decimalStream"></span>
+    </div>
+</div>
+<div class="timer" id="timerDisplay">00:00:00</div>
+
+<script>
+    (function() {
+        // ------------------- INFINITE π SPIGOT GENERATOR -------------------
+        // Rabinowitz & Wagon "spigot" algorithm using BigInt
+        function* infinitePiGenerator() {
+            let q = 1n, r = 180n, t = 60n, i = 2n;
+            while (true) {
+                const y = (q * (27n * i - 12n) + 5n * r) / (5n * t);
+                const u = 3n * (3n * i + 1n) * (3n * i + 2n);
+                r = u * 10n * (q * (5n * i - 2n) + r - y * t);
+                q = 10n * q * i * (2n * i - 1n);
+                t = u * t;
+                i = i + 1n;
+                yield Number(y);
+            }
+        }
+
+        // DOM elements
+        const scrollContainer = document.getElementById('piScrollArea');
+        const decimalContainer = document.getElementById('decimalStream');
+        const timerEl = document.getElementById('timerDisplay');
+
+        const digitGen = infinitePiGenerator();
+        digitGen.next(); // initial state adjustment
+
+        let totalDigits = 0;
+        let pendingBuffer = '';
+        let flushScheduled = false;
+        let autoScrollEnabled = true;
+        let userScrollTimer = null;
+        let lastFlushTime = 0;
+        let isUserInterrupted = false;
+
+        // ---------- pure digital timer ----------
+        const startTime = performance.now();
+        let timerInterval = null;
+
+        function updateTimer() {
+            const elapsed = performance.now() - startTime;
+            const seconds = Math.floor(elapsed / 1000);
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const secs = seconds % 60;
+            timerEl.textContent = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+        }
+
+        function startTimer() {
+            updateTimer();
+            timerInterval = setInterval(updateTimer, 1000);
+        }
+
+        // adaptive batch size: more digits early, smaller later → smooth infinite run
+        function getBatchSize(currentDigits) {
+            if (currentDigits < 800) return 210;
+            if (currentDigits < 5000) return 105;
+            if (currentDigits < 25000) return 52;
+            if (currentDigits < 100000) return 26;
+            return 15;
+        }
+
+        function generateDigits(count) {
+            let chunk = '';
+            for (let i = 0; i < count; i++) {
+                chunk += digitGen.next().value;
+            }
+            return chunk;
+        }
+
+        function flushBuffer() {
+            if (pendingBuffer.length === 0) return;
+            decimalContainer.insertAdjacentHTML('beforeend', pendingBuffer);
+            pendingBuffer = '';
+            lastFlushTime = performance.now();
+
+            if (autoScrollEnabled && !isUserInterrupted) {
+                requestAnimationFrame(() => {
+                    scrollContainer.scrollTop = scrollContainer.scrollHeight;
+                });
+            }
+        }
+
+        function scheduleFlush() {
+            if (flushScheduled) return;
+            flushScheduled = true;
+            setTimeout(() => {
+                flushBuffer();
+                flushScheduled = false;
+            }, 22);
+        }
+
+        function step() {
+            const currentTotal = totalDigits;
+            const batch = getBatchSize(currentTotal);
+            const freshDigits = generateDigits(batch);
+            if (freshDigits.length === 0) return;
+
+            pendingBuffer += freshDigits;
+            totalDigits += freshDigits.length;
+
+            const now = performance.now();
+            const timeSinceFlush = now - lastFlushTime;
+            if (pendingBuffer.length > 320 || timeSinceFlush > 30) {
+                flushBuffer();
+            } else if (!flushScheduled && pendingBuffer.length > 0) {
+                scheduleFlush();
+            }
+        }
+
+        let isRunning = true;
+        function scheduler() {
+            if (!isRunning) return;
+            const start = performance.now();
+            let stepsExecuted = 0;
+            while (performance.now() - start < 9 && stepsExecuted < 5) {
+                step();
+                stepsExecuted++;
+            }
+            const delay = totalDigits < 15000 ? 18 : 28;
+            setTimeout(scheduler, delay);
+        }
+
+        // ---------- smart scroll (pauses on user interaction) ----------
+        function handleUserScroll() {
+            if (!autoScrollEnabled) return;
+            const maxScroll = scrollContainer.scrollHeight - scrollContainer.clientHeight;
+            const isBottom = (scrollContainer.scrollTop + scrollContainer.clientHeight) >= (maxScroll - 48);
+            if (!isBottom) {
+                autoScrollEnabled = false;
+                isUserInterrupted = true;
+                if (userScrollTimer) clearTimeout(userScrollTimer);
+                userScrollTimer = setTimeout(() => {
+                    autoScrollEnabled = true;
+                    isUserInterrupted = false;
+                    scrollContainer.scrollTo({ top: scrollContainer.scrollHeight, behavior: 'smooth' });
+                    userScrollTimer = null;
+                }, 4500);
+            } else if (isBottom && !autoScrollEnabled && !isUserInterrupted) {
+                autoScrollEnabled = true;
+                if (userScrollTimer) {
+                    clearTimeout(userScrollTimer);
+                    userScrollTimer = null;
+                }
+            }
+        }
+
+        scrollContainer.addEventListener('scroll', handleUserScroll);
+
+        let resizeTimer = null;
+        window.addEventListener('resize', () => {
+            if (autoScrollEnabled && !isUserInterrupted) {
+                if (resizeTimer) clearTimeout(resizeTimer);
+                resizeTimer = setTimeout(() => {
+                    scrollContainer.scrollTop = scrollContainer.scrollHeight;
+                }, 70);
+            }
+        });
+
+        // ---------------- initial warm-up: show first 210 digits instantly ----------------
+        function init() {
+            decimalContainer.innerHTML = '';
+            totalDigits = 0;
+            pendingBuffer = '';
+            const warmupCount = 210;
+            let warmStr = '';
+            for (let i = 0; i < warmupCount; i++) {
+                warmStr += digitGen.next().value;
+            }
+            decimalContainer.innerHTML = warmStr;
+            totalDigits = warmupCount;
+            lastFlushTime = performance.now();
+            setTimeout(() => {
+                scrollContainer.scrollTop = scrollContainer.scrollHeight;
+                autoScrollEnabled = true;
+                isUserInterrupted = false;
+            }, 30);
+        }
+
+        init();
+        startTimer();
+        scheduler();
+
+        window.addEventListener('beforeunload', () => {
+            isRunning = false;
+            if (timerInterval) clearInterval(timerInterval);
+        });
+    })();
+</script>
+</body>
+</html>
